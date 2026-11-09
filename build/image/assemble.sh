@@ -217,6 +217,70 @@ echo ==ICD==
 ls -la /dev/dri /system/lib64/egl /vendor/lib64/egl /system/etc/vulkan/icd.d /vendor/etc/vulkan/icd.d /vendor/lib64/hw 2>&1
 EOF
 chmod 0755 "$STAGING/system/bin/stararm-probe.sh"
+
+# ---- ADB 通道修复：QEMU usb-net(RNDIS/ECM) 在 guest 侧默认没人管 ----
+# 症状（boot_test.sh 实证）：内核 cdc_ether/usbnet 模块随 *_dlkm 发布但 boot 时未加载，
+# guest 没有任何网卡 → slirp hostfwd 命中不到 adbd(5555) → "adb TCP 实际不可达"。
+# 这里放一个 boot 服务：加载 usb 网卡模块 → 选中首个可用网卡（usb 优先，其次 virtio/e1000）
+# → 按 QEMU slirp 固定网段（10.0.2.15/24，gw 10.0.2.2）配好 → 打串口诊断。
+# 纯云（GitHub runner TCG）就是靠它把 adb 打通，进而 install/push frida/脱壳。
+cat > "$STAGING/system/bin/stararm-net.sh" <<'EOF'
+#!/system/bin/sh
+export PATH=/system/bin:/vendor/bin:$PATH
+log() { echo "STARARM_NET $*"; }
+
+# 1) 加载 USB 网卡 + 通用网络模块（模块可能在 system_dlkm / vendor_dlkm / vendor/lib/modules）
+for m in usbnet mii cdc_ether rndis_host cdc_subset cdc_ncm; do
+  for d in /vendor_dlkm/lib/modules /system_dlkm/lib/modules /vendor/lib/modules /system/lib/modules; do
+    [ -d "$d" ] && /system/bin/modprobe -d "$d" "$m" 2>/dev/null
+  done
+done
+
+drv_of() { basename "$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null)" 2>/dev/null; }
+
+pick_iface() {
+  for n in /sys/class/net/*; do
+    b=$(basename "$n"); case "$b" in lo) continue;; esac
+    d=$(drv_of "$b")
+    case "$d" in cdc_ether|rndis_host|usbnet|cdc_subset|cdc_ncm) echo "$b"; return;; esac
+  done
+  for n in /sys/class/net/*; do
+    b=$(basename "$n"); case "$b" in lo) continue;; esac
+    d=$(drv_of "$b")
+    case "$d" in virtio_net|e1000|e1000e) echo "$b"; return;; esac
+  done
+}
+
+dev=""; i=0
+while [ "$i" -lt 60 ]; do
+  dev=$(pick_iface)
+  [ -n "$dev" ] && break
+  sleep 2; i=$((i+1))
+done
+
+log "adb.tcp.port=$(getprop service.adb.tcp.port)/$(getprop persist.service.adb.tcp.port)"
+for n in /sys/class/net/*; do b=$(basename "$n"); log "iface=$b drv=$(drv_of "$b")"; done
+
+if [ -z "$dev" ]; then
+  log "FAIL no netdev (usb-net 未绑定且无 virtio/e1000；检查内核模块/设备)"
+  exit 0
+fi
+log "selected=$dev drv=$(drv_of "$dev")"
+ip link set "$dev" up 2>/dev/null
+ip addr add 10.0.2.15/24 dev "$dev" 2>/dev/null
+ip route add default via 10.0.2.2 dev "$dev" 2>/dev/null
+log "configured $dev=$(ip -4 addr show "$dev" 2>/dev/null | tr '\n' ' ')"
+
+# 2) 确保 adbd 走 TCP（部分镜像只在 build.prop 写了，运行时再兜底）
+setprop service.adb.tcp.port 5555 2>/dev/null
+setprop persist.adb.tcp.port 5555 2>/dev/null
+stop adbd 2>/dev/null; start adbd 2>/dev/null
+sleep 1
+log "adbd: $(ps -A 2>/dev/null | grep -c adbd) proc; net: $(netstat -ltn 2>/dev/null | grep -c ':5555') :5555 listeners"
+log "DONE"
+EOF
+chmod 0755 "$STAGING/system/bin/stararm-net.sh"
+
 cat > "$STAGING/init.stararm.rc" <<'EOF'
 # run 41e94a7 实证：双 ICD 注入后 EGL 错误全消失（ANGLE 拿到 swiftshader/pastel 设备），
 # SF 推进到 HWComposer 阶段；但 ranchu composer3 从未 hotplug → "HWC did not hotplug"。
@@ -244,6 +308,15 @@ on post-fs
 # 串口探针（fb6e4c8 实证：init exec sh 因 shell_exec 无 init 域转移而失败；
 # 改 service console（toolbox 域，与 modprobe 同域已验证可跑）→ 输出进 /dev/console）。
 service stararm.probe /system/bin/sh /system/bin/stararm-probe.sh
+    class core
+    user root
+    group root
+    oneshot
+    console
+
+# ADB over usb-net/virtio-net：boot 时加载网卡模块、配好 slirp 网段、兜底重启 adbd TCP。
+# class core → 开机自动执行一次；结果打到 /dev/console（serial.log）便于 CI 取证。
+service stararm.net /system/bin/sh /system/bin/stararm-net.sh
     class core
     user root
     group root
